@@ -4,23 +4,30 @@ mod config;
 mod ops;
 mod secrets;
 mod store;
+mod upstream;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::Router;
 use axum_reverse_proxy::ReverseProxy;
 use clap::Parser;
+use ipnet::IpNet;
 use tokio::signal::unix::SignalKind;
+use tower::ServiceExt;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
 use crate::secrets::{hash_password, random_bytes};
 use crate::store::Store;
+use crate::upstream::{HostTable, RequestHost, Routing};
 
 /// Shared state handed to every handler and middleware.
 #[derive(Clone)]
@@ -33,10 +40,44 @@ pub struct AppState {
     pub metrics: metrics_exporter_prometheus::PrometheusHandle,
 }
 
-fn build_app(state: AppState, upstream: &str) -> Router {
+fn proxy_router(target: &str) -> Router {
+    ReverseProxy::new("", target).into()
+}
+
+/// Forwards to the upstream whose hostname matches the request host.
+async fn dispatch_by_host(
+    State(table): State<Arc<HostTable>>,
+    RequestHost(host): RequestHost,
+    req: Request,
+) -> Response {
+    match table.routes.get(&host) {
+        Some(router) => router
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|never| match never {}),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn build_app(state: AppState, routing: &Routing, trusted_proxies: Vec<IpNet>) -> Router {
     // Everything except /__admin/ goes through the credential guard and then
-    // to the protected service.
-    let proxy: Router = ReverseProxy::new("", upstream).into();
+    // to the protected service(s).
+    let proxy: Router = match routing {
+        Routing::Single(target) => proxy_router(target),
+        Routing::ByHost(routes) => {
+            let table = HostTable {
+                routes: routes
+                    .iter()
+                    .map(|r| (r.host.clone(), proxy_router(&r.target)))
+                    .collect(),
+                trusted_proxies,
+            };
+            Router::new()
+                .fallback(dispatch_by_host)
+                .with_state(Arc::new(table))
+        }
+    };
     let guarded = proxy.layer(from_fn_with_state(state.clone(), auth::guard));
 
     // `nest` matches /__admin and /__admin/<rest> but not the bare trailing
@@ -87,9 +128,24 @@ async fn main() -> anyhow::Result<()> {
         metrics: ops::install_recorder()?,
     };
 
-    let app = build_app(state, &cfg.upstream);
+    let routing = Routing::try_from(cfg.upstream.clone()).map_err(anyhow::Error::msg)?;
+    match &routing {
+        Routing::Single(target) => {
+            tracing::info!(upstream = %target, "single upstream, all hosts forwarded");
+        }
+        Routing::ByHost(routes) => {
+            for r in routes {
+                tracing::info!(host = %r.host, upstream = %r.target, "host routed");
+            }
+        }
+    }
+
+    if !cfg.trusted_proxies.is_empty() {
+        tracing::info!(trusted = ?cfg.trusted_proxies, "X-Forwarded-Host accepted from these peers");
+    }
+    let app = build_app(state, &routing, cfg.trusted_proxies.clone());
     let listener = tokio::net::TcpListener::bind(cfg.listen).await?;
-    tracing::info!(listen = %cfg.listen, upstream = %cfg.upstream, "proxy listening");
+    tracing::info!(listen = %cfg.listen, "proxy listening");
 
     let grace = Duration::from_secs(cfg.shutdown_grace_secs);
     let server = axum::serve(

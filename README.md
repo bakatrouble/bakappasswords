@@ -14,10 +14,11 @@ exchanged for a JWT.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `UPSTREAM_URL` | required | Protected service |
+| `UPSTREAM_URL` | required | Protected service: one URL, or one `external.domain=upstream-url` entry (see Behaviour). Use `--upstream` repeatedly for several entries |
 | `ADMIN_PASSWORD` | required | Admin panel password |
 | `JWT_SECRET` | random per start | Admin JWT signing key |
 | `JWT_TTL_HOURS` | `12` | Admin session lifetime |
+| `TRUSTED_PROXIES` | empty | Comma-separated IPs or CIDRs (e.g. the Caddy host). Only these peers may set `X-Forwarded-Host` |
 | `DATABASE_PATH` | `credentials.db` | SQLite file |
 | `LISTEN_ADDR` | `0.0.0.0:8080` | Listen address |
 | `AUTH_REALM` | `protected` | Realm in `WWW-Authenticate` |
@@ -47,6 +48,19 @@ service. Replace the `app` service and `UPSTREAM_URL` with your own.
 
 ## Behaviour
 
+- Upstreams: with a single plain URL, every request goes to it. To serve
+  several upstreams, give every entry as `external.domain=upstream-url`, e.g.
+  `--upstream app.example.com=http://app:80 --upstream api.example.com=http://api:8000`.
+  The `UPSTREAM_URL` environment variable carries a single entry only.
+  Requests are forwarded to the upstream whose hostname matches the `Host`
+  header (port ignored, case-insensitive); unknown hosts get `404` after the
+  credential check. Hostnames must be unique. Mixing plain URLs with
+  `host=url` entries is a startup error.
+- Host source: when the TCP peer is in `TRUSTED_PROXIES`, the last
+  `X-Forwarded-Host` value is used (this is what Caddy sets). Otherwise the
+  `Host` header is used, and `X-Forwarded-Host` from any peer is ignored.
+  Caddy must be reachable from the proxy's peer address, so list the address
+  Caddy connects from (for example its Docker network IP or subnet).
 - Non-admin requests: `401` with `WWW-Authenticate: Basic` and `Bearer`
   unless a valid credential is sent. Valid requests are forwarded with the
   `Authorization` header removed.
