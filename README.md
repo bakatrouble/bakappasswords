@@ -74,6 +74,14 @@ service. Replace the `app` service and `UPSTREAM_URL` with your own.
 - Admin API (under `/__admin/api`): `POST /login`, and JWT-protected
   `GET|POST /credentials`, `DELETE /credentials/{id}`.
 
+## Protocols
+
+- Clients: HTTP/1.1 and cleartext HTTP/2 (h2c) with prior knowledge, on the
+  same listen port. The `Upgrade: h2c` handshake from HTTP/1.1 is not used;
+  such clients stay on HTTP/1.1.
+- Upstreams: always HTTP/1.1. Cleartext HTTP/2 (h2c) upstreams are not
+  supported.
+
 ## Operations
 
 - `GET /__healthz`: `200 {"status":"ok"}` when SQLite answers, `503` otherwise.
