@@ -1,0 +1,27 @@
+services:
+  proxy:
+    build: .
+    image: basic-auth-proxy:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      UPSTREAM_URL: http://app:80
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      AUTH_REALM: protected
+      JWT_TTL_HOURS: "12"
+    volumes:
+      - proxy-data:/data
+    depends_on:
+      - app
+
+  # Sample protected service. Replace with your own.
+  app:
+    image: traefik/whoami
+    restart: unless-stopped
+    expose:
+      - "80"
+
+volumes:
+  proxy-data:
