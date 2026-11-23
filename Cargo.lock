@@ -308,6 +308,7 @@ dependencies = [
  "axum-vite-spa-bundle",
  "clap",
  "hex",
+ "hyper-util",
  "ipnet",
  "jsonwebtoken",
  "metrics",

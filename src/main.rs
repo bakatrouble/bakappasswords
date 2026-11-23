@@ -18,6 +18,8 @@ use axum::routing::get;
 use axum::Router;
 use axum_reverse_proxy::ReverseProxy;
 use clap::Parser;
+use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::rt::TokioExecutor;
 use ipnet::IpNet;
 use tokio::signal::unix::SignalKind;
 use tower::ServiceExt;
@@ -27,7 +29,7 @@ use tracing_subscriber::EnvFilter;
 use crate::config::Config;
 use crate::secrets::{hash_password, random_bytes};
 use crate::store::Store;
-use crate::upstream::{HostTable, RequestHost, Routing};
+use crate::upstream::{HostTable, RequestHost, Routing, Target};
 
 /// Shared state handed to every handler and middleware.
 #[derive(Clone)]
@@ -40,8 +42,15 @@ pub struct AppState {
     pub metrics: metrics_exporter_prometheus::PrometheusHandle,
 }
 
-fn proxy_router(target: &str) -> Router {
-    ReverseProxy::new("", target).into()
+fn proxy_router(target: &Target) -> Router {
+    if !target.h2c {
+        return ReverseProxy::new("", &target.url).into();
+    }
+    // HTTP/2 prior-knowledge (h2c) client for upstreams marked `!h2c`.
+    let client = Client::builder(TokioExecutor::new())
+        .http2_only(true)
+        .build(HttpConnector::new());
+    ReverseProxy::new_with_client("", &target.url, client).into()
 }
 
 /// Forwards to the upstream whose hostname matches the request host.
@@ -131,11 +140,11 @@ async fn main() -> anyhow::Result<()> {
     let routing = Routing::try_from(cfg.upstream.clone()).map_err(anyhow::Error::msg)?;
     match &routing {
         Routing::Single(target) => {
-            tracing::info!(upstream = %target, "single upstream, all hosts forwarded");
+            tracing::info!(upstream = %target.url, h2c = target.h2c, "single upstream, all hosts forwarded");
         }
         Routing::ByHost(routes) => {
             for r in routes {
-                tracing::info!(host = %r.host, upstream = %r.target, "host routed");
+                tracing::info!(host = %r.host, upstream = %r.target.url, h2c = r.target.h2c, "host routed");
             }
         }
     }

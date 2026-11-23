@@ -79,8 +79,12 @@ service. Replace the `app` service and `UPSTREAM_URL` with your own.
 - Clients: HTTP/1.1 and cleartext HTTP/2 (h2c) with prior knowledge, on the
   same listen port. The `Upgrade: h2c` handshake from HTTP/1.1 is not used;
   such clients stay on HTTP/1.1.
-- Upstreams: always HTTP/1.1. Cleartext HTTP/2 (h2c) upstreams are not
-  supported.
+- Upstreams: HTTP/1.1 by default. An upstream URL with the `!h2c` suffix is
+  reached with HTTP/2 prior knowledge (cleartext h2c), e.g.
+  `--upstream tempo.example.com=http://tempo:4317!h2c`. The suffix works on
+  both plain and `host=url` entries and needs an `http://` URL. Only
+  upstreams that serve h2c should be marked; an unmarked HTTP/2-only upstream
+  returns `502`.
 
 ## Operations
 

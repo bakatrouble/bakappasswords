@@ -8,30 +8,43 @@ use axum::extract::{ConnectInfo, FromRequestParts};
 use axum::http::{HeaderMap, StatusCode, Uri, header, request::Parts};
 use ipnet::IpNet;
 
+/// Marker suffix on an upstream URL that makes the proxy speak HTTP/2
+/// prior-knowledge (cleartext h2c) to that upstream.
+const H2C_MARKER: &str = "!h2c";
+
 /// How incoming requests are mapped to upstream services.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Routing {
-    /// One upstream URL; every request goes to it regardless of Host.
-    Single(String),
+    /// One upstream; every request goes to it regardless of Host.
+    Single(Target),
     /// Several upstreams, each bound to an external hostname.
     ByHost(Vec<HostRoute>),
+}
+
+/// An upstream base URL and how to speak to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// Base URL, e.g. `http://app:80`.
+    pub url: String,
+    /// Use HTTP/2 prior-knowledge (h2c) instead of HTTP/1.1.
+    pub h2c: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRoute {
     /// Lowercase hostname without port, e.g. `app.example.com`.
     pub host: String,
-    /// Upstream base URL, e.g. `http://app:80`.
-    pub target: String,
+    pub target: Target,
 }
 
 /// One `--upstream` value, parsed on its own.
 ///
-/// Either a plain URL or `external.domain=upstream-url`. Whether the set of
-/// entries is valid as a whole is checked when converting to [`Routing`].
+/// Either a plain URL or `external.domain=upstream-url`, optionally followed
+/// by `!h2c`. Whether the set of entries is valid as a whole is checked when
+/// converting to [`Routing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamEntry {
-    Plain(String),
+    Plain(Target),
     Host(HostRoute),
 }
 
@@ -40,16 +53,14 @@ impl FromStr for UpstreamEntry {
 
     fn from_str(entry: &str) -> Result<Self, Self::Err> {
         if !is_host_form(entry) {
-            validate_url(entry)?;
-            return Ok(Self::Plain(entry.to_string()));
+            return Ok(Self::Plain(parse_target(entry)?));
         }
         let (host, target) = entry.split_once('=').ok_or_else(|| {
             format!("upstream `{entry}` must use the form external.domain=upstream-url")
         })?;
         let host = host.trim().to_ascii_lowercase();
-        let target = target.trim().to_string();
         validate_host(&host)?;
-        validate_url(&target)?;
+        let target = parse_target(target.trim())?;
         Ok(Self::Host(HostRoute { host, target }))
     }
 }
@@ -65,7 +76,7 @@ impl TryFrom<Vec<UpstreamEntry>> for Routing {
         let mut hosts = Vec::new();
         for entry in entries {
             match entry {
-                UpstreamEntry::Plain(url) => plain.push(url),
+                UpstreamEntry::Plain(target) => plain.push(target),
                 UpstreamEntry::Host(route) => hosts.push(route),
             }
         }
@@ -106,6 +117,19 @@ pub struct HostTable {
 /// `https://`, so a `=` inside a plain URL's query string is not a separator.
 fn is_host_form(entry: &str) -> bool {
     !(entry.starts_with("http://") || entry.starts_with("https://")) && entry.contains('=')
+}
+
+/// Parses `url` or `url!h2c`.
+fn parse_target(value: &str) -> Result<Target, String> {
+    let (url, h2c) = match value.strip_suffix(H2C_MARKER) {
+        Some(url) => (url, true),
+        None => (value, false),
+    };
+    validate_url(url)?;
+    Ok(Target {
+        url: url.to_string(),
+        h2c,
+    })
 }
 
 fn validate_host(host: &str) -> Result<(), String> {
@@ -202,11 +226,26 @@ mod tests {
         Routing::try_from(entries)
     }
 
+    fn target(url: &str, h2c: bool) -> Target {
+        Target {
+            url: url.into(),
+            h2c,
+        }
+    }
+
     #[test]
     fn single_plain_url() {
         assert_eq!(
             parse(&["http://app:80"]).unwrap(),
-            Routing::Single("http://app:80".into())
+            Routing::Single(target("http://app:80", false))
+        );
+    }
+
+    #[test]
+    fn single_plain_h2c_url() {
+        assert_eq!(
+            parse(&["http://tempo:4317!h2c"]).unwrap(),
+            Routing::Single(target("http://tempo:4317", true))
         );
     }
 
@@ -214,7 +253,7 @@ mod tests {
     fn query_string_in_plain_url_is_not_a_host_form() {
         assert_eq!(
             parse(&["http://app:80/x?a=b"]).unwrap(),
-            Routing::Single("http://app:80/x?a=b".into())
+            Routing::Single(target("http://app:80/x?a=b", false))
         );
     }
 
@@ -224,9 +263,26 @@ mod tests {
             parse(&["App.Example.com=http://app:80"]).unwrap(),
             Routing::ByHost(vec![HostRoute {
                 host: "app.example.com".into(),
-                target: "http://app:80".into()
+                target: target("http://app:80", false),
             }])
         );
+    }
+
+    #[test]
+    fn host_mapping_with_h2c_marker() {
+        assert_eq!(
+            parse(&["tempo.example.com=http://tempo:4317!h2c"]).unwrap(),
+            Routing::ByHost(vec![HostRoute {
+                host: "tempo.example.com".into(),
+                target: target("http://tempo:4317", true),
+            }])
+        );
+    }
+
+    #[test]
+    fn h2c_marker_requires_http_url() {
+        assert!(parse(&["tempo.example.com=tempo:4317!h2c"]).is_err());
+        assert!(parse(&["tempo:4317!h2c"]).is_err());
     }
 
     #[test]
